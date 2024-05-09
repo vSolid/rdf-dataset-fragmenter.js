@@ -1,4 +1,3 @@
-
 import type * as RDF from "@rdfjs/types";
 import { createReadStream, createWriteStream } from "fs";
 import { DataFactory } from "n3";
@@ -23,6 +22,16 @@ export const VS = {
 } as const;
 
 export type VS = typeof VS;
+
+const longHistories = [
+  "00000000000000000933",
+  "00000000000000001129",
+  "00000002199023256077",
+  "00000010995116278291",
+  "00000024189255811254"
+];
+
+const matchNumberRegex = /\/(\d+)\/?/;
 
 export class ArchiveQuadSinkFile extends QuadSinkFile {
   public constructor(options: IQuadSinkFileOptions) {
@@ -51,32 +60,80 @@ export class ArchiveQuadSinkFile extends QuadSinkFile {
   }
 
   public async push(iri: string, quad: RDF.Quad): Promise<void> {
-    super.push(iri, quad);
+    await super.push(iri, quad);
 
     const path = this.getFilePathHelper(iri) + ".vSolid";
     const os = await this.getFileStream(path);
 
-    let delta = await this.createDelta(iri, quad);
-    delta.forEach((quad) => {
+    const delta = await this.createDelta(iri, quad);
+    delta.forEach(quad => os.write(quad));
+
+    const match = iri.match(matchNumberRegex);
+
+    if (match?.[1] && longHistories.includes(match[1].toString())) {
+      await this.generateHistoryForThing(iri, quad, 500);
+    }
+  }
+
+  async generateHistoryForThing(iri: string, thing: RDF.Quad, historyLength: number = 50) {
+    let headDeltaId : string | null = null;
+    const quadstoWrite: RDF.Quad[] = [];
+
+    const path = this.getFilePathHelper(iri) + ".vSolid";
+    const os = await this.getFileStream(path);
+
+    for (let i = 0; i < historyLength; i++) {
+      const newQuad = quad(
+        thing.subject,
+        thing.predicate,
+        literal(`${thing.object.value} ${i}`)
+      );
+
+      const deltaQuads = await this.createDelta(iri, newQuad, VS.insert, false, headDeltaId);
+      headDeltaId = deltaQuads[0].subject.value;
+
+      for (const quad of deltaQuads) {
+        quadstoWrite.push(quad)
+      }
+    }
+
+    for (let i = 0; i < historyLength; i++) {
+      const newQuad = quad(
+        thing.subject,
+        thing.predicate,
+        literal(`${thing.object.value} ${i}`)
+      );
+
+      const deltaQuads = await this.createDelta(iri, newQuad, VS.delete, false, headDeltaId);
+      headDeltaId = deltaQuads[0].subject.value;
+
+      for (const quad of deltaQuads) {
+        quadstoWrite.push(quad)
+      }
+    }
+
+    for (const quad of quadstoWrite) {
       os.write(quad);
-    });
+    }
+
+    await this.writeMetadata(iri, headDeltaId ?? "");
   }
 
   async readMetadataID(iri: string): Promise<string> {
     return new Promise((res, rej) => {
       const path = this.getFilePathHelper(iri) + ".meta";
 
-      let stream = createReadStream(path);
+      const stream = createReadStream(path);
 
-      let rdfStream = rdfParser.parse(stream, { contentType: "text/turtle" });
+      const rdfStream = rdfParser.parse(stream, { contentType: "text/turtle" });
 
-      let quads: RDF.Quad[] = [];
+      const quads: RDF.Quad[] = [];
 
       rdfStream.on("data", (quad) => {
         quads.push(quad);
       });
       rdfStream.on("end", () => {
-        let metadataQuad = quads[0];
+        const metadataQuad = quads[0];
         if (metadataQuad) {
           res(metadataQuad.object.value);
         } else {
@@ -98,7 +155,7 @@ export class ArchiveQuadSinkFile extends QuadSinkFile {
         iri = iri.slice(0, posHash);
       }
 
-      let metaData = quad(
+      const metaData = quad(
         namedNode(iri),
         namedNode(VS.next_delta),
         literal(id)
@@ -114,42 +171,36 @@ export class ArchiveQuadSinkFile extends QuadSinkFile {
     });
   }
 
-  async createDelta(iri: string, test: RDF.Quad): Promise<RDF.Quad[]> {
+  async createDelta(iri: string, operationQuad: RDF.Quad, operation: VS["insert"] | VS["delete"] = VS["insert"], writeMetadata: boolean = true, headDeltaId: string | null = null): Promise<RDF.Quad[]> {
     const id = uuid();
 
-    let deltaDate = quad(
+    const deltaDate = quad(
       namedNode(id),
       namedNode(VS.delta_date),
       literal(new Date().toISOString())
     );
 
-    let metadateID = await this.readMetadataID(iri);
-    let nextDeltaID = metadateID == "" ? blankNode() : literal(metadateID);
+    const metadataId = headDeltaId ?? await this.readMetadataID(iri);
+    const nextDeltaID = metadataId == "" ? blankNode() : literal(metadataId);
 
-    let nextDelta = quad(namedNode(id), namedNode(VS.next_delta), nextDeltaID);
+    const nextDelta = quad(namedNode(id), namedNode(VS.next_delta), nextDeltaID);
 
-    let operations: RDF.Quad[] = [
+    const operations: RDF.Quad[] = [
       quad(
         namedNode(id),
         namedNode(VS.contains_operation),
-        this.createOperation(test, VS.insert)
+        this.createOperation(operationQuad, operation)
       ),
     ];
 
-    let delta: RDF.Quad[] = [deltaDate, nextDelta, ...operations];
+    const delta: RDF.Quad[] = [deltaDate, nextDelta, ...operations];
 
-    await this.writeMetadata(iri, id);
+    if (writeMetadata) await this.writeMetadata(iri, id);
 
     return delta;
   }
 
   createOperation(subject: RDF.Quad, type: string): RDF.Quad {
-    let operation = quad(subject, namedNode(VS.operation), namedNode(type));
-
-    return operation;
-  }
-
-  close(): Promise<void> {
-    return super.close();
+    return quad(subject, namedNode(VS.operation), namedNode(type));
   }
 }
