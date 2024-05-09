@@ -3,7 +3,6 @@ import { createReadStream, createWriteStream } from "fs";
 import { DataFactory } from "n3";
 import rdfParser from "rdf-parse";
 import rdfSerializer from "rdf-serialize";
-import type { Writable } from "stream";
 import { v4 as uuid } from "uuid";
 import { IQuadSinkFileOptions, QuadSinkFile } from "./QuadSinkFile";
 import streamifyArray = require("streamify-array");
@@ -23,27 +22,20 @@ export const VS = {
 
 export type VS = typeof VS;
 
-const longHistories = [
-  "00000000000000000933",
-  "00000000000000001129",
-  "00000002199023256077",
-  "00000010995116278291",
-  "00000024189255811254"
-];
+const historyLengths = {
+  "scale1": 1,
+  "scale10": 10,
+  "scale100": 100,
+  "scale1_000": 1_000,
+  "scale10_000": 10_000,
+} as const;
 
 const matchNumberRegex = /\/(\d+)\/?/;
 
 export class ArchiveQuadSinkFile extends QuadSinkFile {
   public constructor(options: IQuadSinkFileOptions) {
     super(options);
-  }
-
-  protected attemptLog(newLine?: boolean | undefined): void {
-    return super.attemptLog(newLine);
-  }
-
-  protected getFilePath(iri: string): string {
-    return super.getFilePath(iri);
+    this.generateTestData();
   }
 
   private getFilePathHelper(iri: string): string {
@@ -55,8 +47,20 @@ export class ArchiveQuadSinkFile extends QuadSinkFile {
     return super.getFilePath(iri).replace("$.ttl", "");
   }
 
-  protected getFileStream(path: string): Promise<Writable> {
-    return super.getFileStream(path);
+  private async generateTestData() {
+    for (const [key, value] of Object.entries(historyLengths)) {
+      const iri = `http://localhost:3000/test/${key}#data`;
+      for (let i = 0; i < value; i++) {
+        const thing = quad(
+          namedNode(iri),
+          namedNode("http://example.org/property"),
+          literal(`test ${i}`)
+        );
+        await this.push(iri, thing);
+      }
+      console.log("");
+      console.log("Generated test data for", key);
+    }
   }
 
   public async push(iri: string, quad: RDF.Quad): Promise<void> {
@@ -67,12 +71,6 @@ export class ArchiveQuadSinkFile extends QuadSinkFile {
 
     const delta = await this.createDelta(iri, quad);
     delta.forEach(quad => os.write(quad));
-
-    const match = iri.match(matchNumberRegex);
-
-    if (match?.[1] && longHistories.includes(match[1].toString())) {
-      await this.generateHistoryForThing(iri, quad, 500);
-    }
   }
 
   async generateHistoryForThing(iri: string, thing: RDF.Quad, historyLength: number = 50) {
@@ -120,28 +118,24 @@ export class ArchiveQuadSinkFile extends QuadSinkFile {
   }
 
   async readMetadataID(iri: string): Promise<string> {
-    return new Promise((res, rej) => {
-      const path = this.getFilePathHelper(iri) + ".meta";
+    const path = this.getFilePathHelper(iri) + ".meta";
+    const quads = await this.readQuadsFromFile(path);
+    return quads[0]?.object.value ?? "";
+  }
 
+  async readQuadsFromFile(path: string) : Promise<RDF.Quad[]> {
+    return new Promise((resolve, reject) => {
       const stream = createReadStream(path);
-
       const rdfStream = rdfParser.parse(stream, { contentType: "text/turtle" });
-
       const quads: RDF.Quad[] = [];
-
       rdfStream.on("data", (quad) => {
         quads.push(quad);
       });
       rdfStream.on("end", () => {
-        const metadataQuad = quads[0];
-        if (metadataQuad) {
-          res(metadataQuad.object.value);
-        } else {
-          res("");
-        }
+        resolve(quads);
       });
       rdfStream.on("error", () => {
-        res("");
+        resolve(quads);
       });
     });
   }
